@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import tensorflow as tf
 from transformers.modeling_tf_utils import TFConv1D, get_initializer
@@ -164,9 +164,12 @@ class LoRADense(layers.Layer):
 
 
 class ApproxTFAttention(TFAttention):
-    def __init__(self, nx, config, num_casual_blocks: int = 1, *args, **kwargs):
+    def __init__(
+        self, nx, config, top_k: int = 16, reduction: int = 8, *args, **kwargs
+    ):
         super().__init__(nx=nx, config=config, *args, **kwargs)
-        self.num_casual_blocks = num_casual_blocks
+        self.top_k = top_k
+        self.reduction = reduction
 
     @classmethod
     def apply_casual_attention_mask(cls, w):
@@ -174,6 +177,13 @@ class ApproxTFAttention(TFAttention):
         b = cls.causal_attention_mask(nd, ns, dtype=w.dtype)
         b = tf.reshape(b, [1, 1, nd, ns])
         return w * b - 1e4 * (1 - b)
+
+    def call(self, inputs, *args, **kwargs):
+        self._last_inputs = inputs
+        # print(f"calling approx attention on inputs: {inputs.shape}")
+        outputs = super().call(inputs, *args, **kwargs)
+        self._last_outputs = outputs
+        return outputs
 
     def _attn(
         self,
@@ -187,16 +197,24 @@ class ApproxTFAttention(TFAttention):
     ):
         # q, k, v have shape [batch, heads, sequence, features]
         # is now [batch, heads, dst_sequence, src_sequence]
-        q = (q[..., ::2] + q[..., 1::2]) / 2
-        k = (k[..., ::2] + k[..., 1::2]) / 2
+        bs, heads, nd, ns = shape_list(q)
+
+        # q_reduced = tf.reshape(q, [bs, heads, nd, ns // self.reduction, self.reduction])
+        # k_reduced = tf.reshape(k, [bs, heads, nd, ns // self.reduction, self.reduction])
+        #
+        # q_reduced = tf.reduce_sum(q_reduced, axis=-1)
+        # k_reduced = tf.reduce_sum(k_reduced, axis=-1)
+        #
+        # w = tf.matmul(q_reduced, k_reduced, transpose_b=True)
         w = tf.matmul(q, k, transpose_b=True)
+        scale = 1.0
         if self.scale:
-            dk = tf.cast(shape_list(k)[-1], dtype=w.dtype)  # scale attention_scores
-            w = w / tf.math.sqrt(dk)
+            dk = tf.cast(shape_list(k)[-1], dtype=w.dtype)
+            scale = tf.math.sqrt(dk)  # scale attention_scores
+            w = w / scale
 
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
-
             # w has shape [batch, heads, dst_sequence, src_sequence], where information flows from src to dst.
             _, _, nd, ns = shape_list(w)
             b = self.causal_attention_mask(nd, ns, dtype=w.dtype)
@@ -208,14 +226,31 @@ class ApproxTFAttention(TFAttention):
             attention_mask = tf.cast(attention_mask, dtype=w.dtype)
             w = w + attention_mask
 
-        w = casual_softmax(w, self.num_casual_blocks)
-        w = self.attn_dropout(w, training=training)
-
         # Mask heads if we want to
         if head_mask is not None:
             w = w * head_mask
 
-        outputs = [tf.matmul(w, v)]
+        logits, indices = tf.math.top_k(w, k=self.top_k, sorted=True)
+        logits_dims = shape_list(logits)[:-1]
+        sampled_indices = tf.random.categorical(
+            tf.reshape(logits, [-1, self.top_k]), num_samples=1
+        )
+        sampled_indices = tf.reshape(sampled_indices, logits_dims)
+        sampled_indices = tf.stop_gradient(sampled_indices)
+
+        # exact scores
+        k_sampled = tf.gather(k, sampled_indices, batch_dims=2)
+        w_top_logits = tf.reduce_sum(q * k_sampled, axis=-1, keepdims=True) / scale
+
+        max_logits = tf.reduce_max(logits, axis=-1, keepdims=True)
+        denom = tf.reduce_sum(tf.exp(logits - max_logits), axis=-1, keepdims=True)
+        probs = tf.exp(w_top_logits - max_logits) / denom
+
+        v_sampled = tf.gather(v, sampled_indices, batch_dims=2)
+        attention_result = probs * v_sampled
+        attention_result = self.attn_dropout(attention_result, training=training)
+
+        outputs = [attention_result]
         if output_attentions:
             outputs.append(w)
         return outputs
@@ -238,3 +273,118 @@ def casual_softmax(x: tf.Tensor, num_blocks: int = 2) -> tf.Tensor:
         x_probs.append(x_split)
 
     return tf.concat(x_probs, axis=2)
+
+
+class TopKFrozenEmbeddings(layers.Layer):
+    def set_embeddings_matrix(self, embeddings: tf.Tensor, dtype: tf.DType = None):
+        self.r = 8
+        self.top_k = 5
+        if dtype is not None:
+            embeddings = tf.cast(embeddings, dtype=dtype)
+        self.embeddings = embeddings
+        self.embeddings_reduced = self.reduce_dim(embeddings)
+
+    @property
+    def hidden_size(self) -> int:
+        return self.embeddings.shape[-1]
+
+    @property
+    def vocab_size(self) -> int:
+        return self.embeddings.shape[0]
+
+    def reduce_dim(self, x: tf.Tensor) -> tf.Tensor:
+        r = self.r
+        d = x.shape[-1]
+        return tf.reduce_sum(tf.reshape(x, [-1, d // r, r]), -1)
+
+    def call(self, inputs: tf.Tensor, mode: str = "embedding", *args, **kwargs):
+        if mode == "embedding":
+            return self._embedding(inputs)
+        elif mode == "linear":
+            return self._linear(inputs)
+        elif mode == "test":
+            return self._linear_exact(inputs)
+        else:
+            raise ValueError(f"mode {mode} is not valid.")
+
+    def _embedding(self, input_ids):
+        """Applies embedding based on inputs tensor."""
+        return tf.gather(self.embeddings, input_ids)
+
+    def _linear_exact(self, inputs):
+        """
+        Computes logits by running inputs through a linear layer.
+
+        Args:
+            inputs: A float32 tensor with shape [..., hidden_size]
+
+        Returns:
+            float32 tensor with shape [..., vocab_size].
+        """
+        dims = shape_list(inputs)
+        x = tf.reshape(inputs, [-1, self.hidden_size])
+        logits = tf.matmul(x, self.embeddings, transpose_b=True)
+        return tf.reshape(logits, dims[:-1] + [self.vocab_size])
+
+    def _linear(self, inputs: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        dims = shape_list(inputs)
+        x = tf.reshape(inputs, [-1, self.hidden_size])
+        # [batch, dim]
+        x_reduced = self.reduce_dim(x)
+        # [batch, dim // r]
+
+        approx_scores = tf.matmul(x_reduced, self.embeddings_reduced, transpose_b=True)
+        # [batch, num_embeddings]
+
+        _, top_indices = tf.math.top_k(approx_scores, k=self.top_k)
+
+        # computing exact scores on sampled top approx scores
+        top_embeddings = tf.gather(self.embeddings, top_indices, batch_dims=0)
+        logits = tf.reduce_sum(tf.expand_dims(x, 1) * top_embeddings, -1)
+        scores = tf.nn.softmax(logits)
+
+        probs = tf.reduce_max(scores, axis=-1)
+        # [batch, ]
+        indices = tf.gather(top_indices, tf.argmax(scores, axis=-1), batch_dims=1)
+        # [batch, ]
+        probs = tf.reshape(probs, dims[:-1])
+        indices = tf.reshape(indices, dims[:-1])
+        return probs, indices
+
+    @classmethod
+    def get_loss(
+        cls, y_pred_probs: tf.Tensor, y_pred_indices: tf.Tensor, y_true: tf.Tensor
+    ) -> tf.Tensor:
+        y_true_labels = y_true[..., 0]
+        y_true_mask = y_true[..., 1]
+
+        y_true_mask = tf.cast(y_true_mask, y_pred_probs.dtype)
+
+        y_true = tf.cast(y_pred_indices == y_true_labels, y_pred_probs.dtype)
+        y_pred_probs = tf.expand_dims(y_pred_probs, -1)
+        y_true = tf.expand_dims(y_true, -1)
+
+        losses = tf.losses.binary_crossentropy(y_true, y_pred_probs)
+
+        masked_loss = losses * y_true_mask
+        return tf.reduce_mean(tf.reduce_mean(masked_loss, axis=-1))
+
+    @classmethod
+    def get_simple_accuracy_metric(cls, y_true, y_pred):
+        y_true_flat = tf.reshape(y_true[..., 0], [-1])
+        y_pred_flat = tf.reshape(y_pred, [-1])
+        indices = tf.where(tf.reshape(y_true[..., 1], [-1]) > 0)
+
+        equals = tf.gather(y_true_flat, indices) == tf.gather(y_pred_flat, indices)
+        equals = tf.cast(equals, dtype=tf.float32)
+        return tf.reduce_mean(tf.reduce_mean(equals, axis=-1))
+
+    @classmethod
+    def get_named_loss_layer(cls, name: str):
+        return tf.keras.layers.Lambda(lambda x: cls.get_loss(*x), name=name)
+
+    @classmethod
+    def get_named_accuracy_layer(cls, name: str):
+        return tf.keras.layers.Lambda(
+            lambda x: cls.get_simple_accuracy_metric(*x), name=name
+        )

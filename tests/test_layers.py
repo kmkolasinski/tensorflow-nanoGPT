@@ -77,7 +77,7 @@ class TestLayers(tf.test.TestCase):
         config = GPT2Config.from_pretrained("gpt2")
         nx = config.n_embd
         layer = TFAttention(nx, config, scale=True)
-        approx_layer = nl.ApproxTFAttention(nx, config, num_casual_blocks=1, scale=True)
+        approx_layer = nl.ApproxTFAttention(nx, config, scale=True)
 
         args = dict(
             layer_past=None,
@@ -96,16 +96,16 @@ class TestLayers(tf.test.TestCase):
         approx_layer(x, **args)
         approx_layer.set_weights(layer.get_weights())
 
-        # y1 = layer(x, **args)[0]
-        # y2 = approx_layer(x, **args)[0]
+        layer(x, **args)[0]
+        approx_layer(x, **args)[0]
         # # self.assertAllClose(y1, y2)
 
         with measuretime("baseline"):
-            for _ in range(50):
+            for _ in range(20):
                 layer(x, **args)
 
         with measuretime("casual"):
-            for _ in range(50):
+            for _ in range(20):
                 approx_layer(x, **args)
 
     def test_casual_softmax(self):
@@ -127,3 +127,39 @@ class TestLayers(tf.test.TestCase):
         with measuretime("casual"):
             for _ in range(100):
                 casual_softmax(x)
+
+    def test_TopKFrozenEmbeddings(self):
+        embeddings = tf.random.normal((20000, 512))
+        input_ids = tf.random.uniform((57, 3), minval=0, maxval=20000, dtype=tf.int32)
+
+        layer = nl.TopKFrozenEmbeddings()
+        layer.set_embeddings_matrix(embeddings)
+
+        y = layer(input_ids)
+        self.assertEqual(y.shape, (57, 3, 512))
+
+        x = tf.random.uniform((57, 512)) - 0.5
+        probs1, indices1 = layer(x, mode="linear")
+        self.assertEqual(probs1.shape, (57,))
+        self.assertEqual(indices1.shape, (57,))
+
+        probs2, indices2 = layer(y, mode="linear")
+        self.assertEqual(probs2.shape, (57, 3))
+        self.assertEqual(indices2.shape, (57, 3))
+
+        self.assertAllClose(indices2, input_ids)
+
+        logits = layer(y, mode="test")
+        self.assertEqual(logits.shape, (57, 3, 20000))
+
+        y_true = tf.stack([input_ids, tf.ones_like(input_ids)], -1)
+
+        loss = layer.get_loss(probs2, indices2, y_true)
+        self.assertAllClose(loss, 0.0)
+
+        y_true = tf.stack([input_ids + 1, tf.ones_like(input_ids)], -1)
+        loss = layer.get_loss(probs2, indices2, y_true)
+        # loss / 15 should be of order 1
+        self.assertAllClose(
+            loss / 15, tf.losses.binary_crossentropy([1.0], [0.0]) / 15, atol=0.01
+        )
