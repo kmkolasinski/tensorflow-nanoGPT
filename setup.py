@@ -1,5 +1,6 @@
 from setuptools import find_packages, setup
-from wise_geometry.version import version
+
+from tf_nano_gpt.version import version
 
 setup(
     name="tf_nano_gpt",
