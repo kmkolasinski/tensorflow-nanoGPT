@@ -1,0 +1,5 @@
+transformers==4.28.0
+datasets==2.11.0
+tensorflow==2.11.0
+keras==2.11.0
+keras-nlp==0.4.1
